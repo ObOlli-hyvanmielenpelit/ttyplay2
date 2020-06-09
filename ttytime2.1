@@ -1,0 +1,64 @@
+.\"
+.\" This manual page is written by Olli Lounela <olli.lounela@hyvanmielenpelit.fi>
+.\"
+.TH TTYTIME 1
+.SH NAME
+ttytime2 \- analyze the recorded sessions data by ttyrec(1)
+.SH SYNOPSIS
+.br
+.B ttytime2
+.I file...
+.SH DESCRIPTION
+.B ttytime2
+tells you various data of the time of recorded data in each file:
+
+    elapsed time in seconds
+    elapsed time in HH:mm:ss
+    count of records
+
+and for total of all files: 
+
+    length distribution of records:
+        length of record in chars
+        log2 of length
+        count of records up to length log2(n) non-cumulative
+        log2 histogram of count
+    total records and log2 magnitude of that
+    duration distribution of records:
+        time in seconds
+        log2 of time
+        count of records of up to duration log2(t) non-cumulative
+        log2 histogram of count
+    total time for records
+    average time elapsed for actions
+
+.SH EXAMPLE
+.sp
+.RS
+.nf
+% ttytime2 *.ttyrec
+Replay time of file(s) (sec, HH:mm:ss)
+  19692	5:28:12 31829 foo.ttyrec
+  12295	3:24:55 19606 bar.ttyrec
+2 file(s) analyzed.
+
+Length distribution of screen updates:
+< 1	(2^0)	997	******
+< 2	(2^1)	191	******
+(...)
+Total records: 51435, magnitude = 2^15
+Duration distribution of actions, sec:
+< 1	(2^0)	46295	*********
+< 2	(2^1)	3943	********
+(...)
+Total time: 31987 sec.
+Average of action durations: 0.62 sec
+.fi
+.RE
+
+.SH "SEE ALSO"
+.BR script (1),
+.BR ttyrec (1),
+.BR ttyplay (1)
+.BR ttytime (1)
+
