@@ -503,7 +503,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                 struct timeval seek_target = timeval_add(time_elapsed, seek_request);
                 /* seek_file_index seeks header preceding CLRSCR and 
                     adjusts fp to point to this file/pos. 
-                    returns sec elapsed from start-of-all.          */
+                    returns timeval elapsed from start-of-all.          */
 #ifdef DEBUG
                 fprintf(stderr, "Seek of %lds requested at %.3f, seek_target is %.3fs\n", 
                         seek_request.tv_sec, 
@@ -514,7 +514,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
 #ifdef DEBUG
                 fprintf(stderr, "Position at beginning of clrscr record %lds\n", time_elapsed.tv_sec);
 #endif
-                /* Now we're to CLRSCR, next sub-CLRSCR seek        */
+                /* Now we're to CLRSCR record start, next sub-CLRSCR seek   */
                 long int cur_pos = ftell(fp);  /* for reseeking back to start-of-record */
                 int first_loop = 1;
                 struct timeval time_diff;
@@ -526,8 +526,13 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                         time_diff = timeval_diff(prev, h.tv);
                         if (timeval_sub(seek_target, 
                                 timeval_add(time_elapsed, time_diff)).tv_sec < 0) {
+#ifdef DEBUG                            
+                            fprintf(stderr, "Quitting seek: next step would go into future by %lds\n",
+                                -(timeval_sub(seek_target,
+                                timeval_add(time_elapsed, time_diff)).tv_sec));
+#endif                        
+                            write_func(buf, h.len);     /* output the record    */
                             break;
-                        write_func(buf, h.len);     /* output the record    */
                         }
                     }
                     cur_pos = ftell(fp);
