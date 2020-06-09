@@ -537,6 +537,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     }
                     cur_pos = ftell(fp);
                     time_elapsed = timeval_add(time_elapsed, time_diff);   /* where-we-are         */
+                    write_func(buf, h.len);             /* output the record    */
                     prev = h.tv;
                 }
                 /* sub-CLRSCR seek ends here, reposition back to 
