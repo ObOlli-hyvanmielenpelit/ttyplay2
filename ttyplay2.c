@@ -47,6 +47,17 @@
 #include "io.h"
 
 #define DEBUG
+#ifdef DEBUG
+#include <libgen.h>
+#include <sys/stat.h>
+#endif
+
+#define JUMPBASE 15         /* base of how much to jump, sec    */
+#define JUMP_SCALE 10       /* scaling for next bigger jump     */
+#define BUFSIZE 8192        /* max record length (investigated length 4095) */
+#ifdef USE_CURSES
+#define CLRSCR "\x1b[2J"
+#endif
 
 typedef double	(*WaitFunc)	(struct timeval prev, 
 				 struct timeval cur, 
@@ -56,29 +67,14 @@ typedef void	(*WriteFunc)	(char *buf, int len);
 typedef void	(*ProcessFunc)	(FILE *fp, double speed, 
 				 ReadFunc read_func, WaitFunc wait_func);
 
-/****** ObOlli *****/
-typedef struct FILEID
-{
-    char *filename;
-    struct FILEID *prev;
-    struct FILEID *next;
-    struct timeval time_elapsed_file; /* tv since start of all files at end */
-    struct CLRSCRID *first_clrscr;
-    struct CLRSCRID *last_clrscr;
-} File_ID;
-typedef struct CLRSCRID
-{
-    struct FILEID *fileidx;
-    long int record_start; /* within file */
-    long int position;     /* within file */
-    struct timeval time_elapsed_cls; /* tv since start of all files at end */
-    struct CLRSCRID *prev;
-    struct CLRSCRID *next;
-} Clrscr_ID;
-
-            /* ugly hack to enable seeking */
+    /* pretty ugly hack to enable seeking */
 static struct timeval time_elapsed, seek_request;
-static File_ID *index_head;
+static File_ID *index_head, *current_file;
+
+#ifdef DEBUG
+/* translate timeval to f */
+#define tv2f(tv) ((float) tv.tv_sec + (float) tv.tv_usec/1000000)
+#endif
 
 /* From glibc-2.2.3 (libc4.18) manual
   (https://ftp.gnu.org/old-gnu/Manuals/glibc-2.2.3/html_node/libc_418.html)
@@ -94,7 +90,7 @@ static File_ID *index_head;
 
     NB. This means the timeval arithmetic below is not designed to be 
     completely portable.
-/****** /ObOlli *****/
+    --ObOlli                                                    */    
 
 struct timeval
 timeval_diff (struct timeval tv1, struct timeval tv2)
@@ -123,7 +119,6 @@ timeval_div (struct timeval tv1, double n)
     return div;
 }
 
-/****** ObOlli *****/
 /* Keeping with original code, will not attempt complete portability
     in timeval_sub and timeval_add */
 struct timeval
@@ -156,17 +151,30 @@ timeval_add (struct timeval tv1, struct timeval tv2)
     return sum;
 }
 
+void free_clrscrid(Clrscr_ID *clsid_ptr)
+{
+    if(clsid_ptr->next)
+        free_clrscrid(clsid_ptr->next);
+    free(clsid_ptr);
+}
+
+void free_fileid(File_ID *fileid_ptr)
+{
+    if(fileid_ptr->next)
+        free_fileid(fileid_ptr->next);
+    free_clrscrid(fileid_ptr->first_clrscr);
+    free(fileid_ptr);
+}
+
 /* index_one_file returns length of file in timeval */
-struct timeval index_one_file(File_ID *file_id, struct timeval whence_cls)
+struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
 {
     int cur_record, bytes_read, clrscr_pos;
     FILE *fp = efopen(file_id->filename, "r");
-    Header cur_header, prev_header, last_header;
-#define BUFSIZE 8192 /* max record length (investigated length 4095) */
-#define CLRSCR "\x1b[2J"
+    Header cur_header, prev_header;
     char buf[BUFSIZE+1], *clrscr_loc; /* leave space in buf for null */
     Clrscr_ID *first_clrscr, *prev_clrscr, *cur_clrscr;
-    struct timeval header_tdelta;
+    int prev_was_cls = 0;
 
     prev_clrscr = NULL;
 #ifdef DEBUG
@@ -176,36 +184,44 @@ struct timeval index_one_file(File_ID *file_id, struct timeval whence_cls)
     prev_header.tv.tv_sec=0;    /* never happens, this is seconds since epoch */
     while (1)
     {
-        cur_record = ftell(fp);                             /* to set start of current header */
+        cur_record = ftell(fp);             /* to set start of current header */
 #ifdef DEBUG
         iteration_count++;
 #endif
         int read_temp = read_header(fp, &cur_header);
-        if (read_temp  == 0)              /* read the header  */
-            break;                                          /* EOF              */
+        if (read_temp  == 0)                /* read the header  */
+            break;                          /* EOF              */
         if (cur_header.len > BUFSIZE) {
             printf("Record payload of %d exceeds buffer size %d. Exiting.", 
                    cur_header.len, BUFSIZE);
             exit(EXIT_FAILURE);
         }
-        if (prev_header.tv.tv_sec == 0)                     /* first header of file */
-            prev_header = cur_header;                       /* init for time arithmetic */
+        if (prev_header.tv.tv_sec == 0)     /* first header of file */
+            prev_header = cur_header;       /* init for time arithmetic */
+
         bytes_read = fread(buf, sizeof(char), cur_header.len, fp); /* record payload*/
         buf[bytes_read] = 0;                                /* for strstr, need it? */
+        /* keep track of time, for each and every record    */
+        where_we_are = timeval_add(where_we_are, 
+                    timeval_sub(cur_header.tv, prev_header.tv));
+
         if (!(clrscr_loc = strstr(buf, CLRSCR))) {
-            last_header = cur_header;                       /* no CLRSCR in record */
+
+            prev_header = cur_header;                       /* no CLRSCR in record */
             continue;
         }
+
         /* here we have header and payload with CLRSCR */
         clrscr_pos = clrscr_loc - buf;      /* position of clrscr in buf    */
         cur_clrscr = (Clrscr_ID*) malloc(sizeof(Clrscr_ID));
+#ifdef DEBUG
+        fprintf(stderr, "New CLRSCR malloc'd, record #%d at %db %.6f\n", 
+            iteration_count, cur_record, tv2f(where_we_are));
+#endif
         if (prev_clrscr == NULL) 
             prev_clrscr = first_clrscr = cur_clrscr;        /* first record of file */
 
-        /* update when_we_are to end of record, then update time_elapsed_cls    */
-        header_tdelta = timeval_sub(cur_header.tv, prev_header.tv);
-        whence_cls = timeval_add(whence_cls, header_tdelta);
-        cur_clrscr->time_elapsed_cls = whence_cls;
+        /* update where_we_are to end of record, then update time_elapsed_cls    */
 
         /* update of the rest of cur_clrscr is straightforward     */
         cur_clrscr->prev = prev_clrscr;
@@ -214,6 +230,10 @@ struct timeval index_one_file(File_ID *file_id, struct timeval whence_cls)
         cur_clrscr->fileidx = file_id;
         cur_clrscr->record_start = cur_record;              /* pointer into file    */
         cur_clrscr->position = cur_record + sizeof(cur_header) + clrscr_pos;
+
+        /* update prev_clrscr ending time if not first clrscr*/
+        if(cur_clrscr->prev != cur_clrscr)
+            cur_clrscr->prev->time_elapsed_cls = where_we_are;
         /* for next iteration */
         prev_clrscr = cur_clrscr;
         prev_header = cur_header;
@@ -225,12 +245,16 @@ struct timeval index_one_file(File_ID *file_id, struct timeval whence_cls)
     file_id->first_clrscr = first_clrscr;
     file_id->last_clrscr = cur_clrscr;
 
-    /* final time arithmetic. prev_header is the last header existent, whence_cls
-        has been updated to up to it. cur_header may have been clobbered.  */
-    header_tdelta = timeval_sub(last_header.tv, prev_header.tv);
-    whence_cls = timeval_add(whence_cls, header_tdelta);
     efclose(fp);
-    return(whence_cls);
+    /* prev_header is the last header existent, where_we_are is at EOF. 
+       cur_header has been clobbered.
+       NB. we don't create non-CLRSCR -record till EOF.             */
+
+#ifdef DEBUG
+    fprintf(stderr, "file done at %.6fs, %d records.\n", 
+        tv2f(where_we_are), iteration_count);
+#endif
+    return(where_we_are);
 }
 
 /* creates file index, returns pointer to index head    */
@@ -244,6 +268,9 @@ File_ID * create_file_index(int start_arg, int argc, char **argv)
     for (argp = start_arg; argp < argc; argp++)
     {
         cur_file = (File_ID*) malloc(sizeof(File_ID));
+#ifdef DEBUG
+        fprintf(stderr, "\nFile_ID malloc'd for %s\n", argv[argp]);
+#endif
         if (argp == start_arg)
         {
             prev_file = first_file = cur_file;
@@ -258,6 +285,9 @@ File_ID * create_file_index(int start_arg, int argc, char **argv)
         cur_file->time_elapsed_file = whence_in_file;
         prev_file = cur_file;
     }
+#ifdef DEBUG
+    fprintf(stderr, "\n*** indexing complete *** \n\n");
+#endif
     return (first_file);
 }
 
@@ -281,15 +311,16 @@ struct timeval seek_file_index(FILE *fp, struct timeval seek_target)
     else
         when_we_are = cur_file->prev->time_elapsed_file;
 
-    while (timeval_diff(cur_file->time_elapsed_file, seek_target).tv_sec >0 &&
+    while (timeval_diff(cur_file->time_elapsed_file, seek_target).tv_sec >=0 &&
             cur_file->next != NULL) {
         when_we_are = cur_file->time_elapsed_file;
         cur_file = cur_file->next;
     }    
 
 #ifdef DEBUG
+    char *fn = basename(strdup(cur_file->filename));
     fprintf(stderr, "seek_file_index: found file %s ranging %lds through %lds\n", 
-            cur_file->filename, 
+            fn, 
             cur_file->prev == cur_file ? 0 : cur_file->prev->time_elapsed_file.tv_sec,
             cur_file->time_elapsed_file.tv_sec);
 #endif
@@ -297,31 +328,34 @@ struct timeval seek_file_index(FILE *fp, struct timeval seek_target)
     /* Now find the CLRSCR preceding seekpoint  */
     cur_clrscr = cur_file->first_clrscr;
     /* when_we_are is already correct            */ 
-    while (timeval_diff(cur_clrscr->time_elapsed_cls, seek_target).tv_sec >0 &&
+    while (timeval_diff(cur_clrscr->time_elapsed_cls, seek_target).tv_sec >=0 &&
             cur_clrscr->next != NULL) {
         when_we_are = cur_clrscr->time_elapsed_cls;
         cur_clrscr = cur_clrscr->next;
     }
 
 #ifdef DEBUG
-    fprintf(stderr, "seek_file_index: found clrscr at %ldb ranging %lds through %lds\n", 
+    fprintf(stderr, "seek_file_index: found clrscr at %ldb ranging %.6fs through ", 
             cur_clrscr->record_start, 
-            cur_clrscr->prev == cur_clrscr ? 0 : cur_clrscr->prev->time_elapsed_cls.tv_sec,
-            cur_clrscr->time_elapsed_cls.tv_sec);
-    if (cur_clrscr->next == NULL)
-        fprintf(stderr, "Note: this is the last clrscr of this file\n");
+            cur_clrscr->prev == cur_clrscr ? 
+                0 : tv2f(cur_clrscr->prev->time_elapsed_cls));
+    if(cur_clrscr->next == NULL) 
+        fprintf(stderr, "EOF\n");
+    else 
+        fprintf(stderr, "%.6f\n", tv2f(cur_clrscr->time_elapsed_cls));
 #endif
 
     /* switch fp to whichever file/record the index points to */
 #ifdef DEBUG
-    fprintf(stderr, "seek_file_index: switching to file %s\n", cur_file->prev->filename);
+    fn = basename(strdup(cur_file->filename));
+    fprintf(stderr, "seek_file_index: switching to file %s\n", fn);
 #endif
-    freopen(cur_file->filename, "r", fp);
+    current_file = cur_file;        /* propagate file to main() */
+    freopen(current_file->filename, "r", fp);
     fseek(fp, cur_clrscr->record_start, SEEK_SET);
     /* the elapsed time is found at end of previous clrscr */
-    return (cur_clrscr->prev->time_elapsed_cls);
+    return (when_we_are);
 }
-/****** /ObOlli *****/
 
 double
 ttywait (struct timeval prev, struct timeval cur, double speed)
@@ -338,9 +372,6 @@ ttywait (struct timeval prev, struct timeval cur, double speed)
     if (diff.tv_sec < 0) {
 	diff.tv_sec = diff.tv_usec = 0;
     }
-
-#define JUMPBASE 15         /* base of how much to jump, sec*speed    */
-#define JUMP_SCALE 10       /* scaling for next bigger jump     */
 
     FD_SET(STDIN_FILENO, &readfs);
     /* 
@@ -367,10 +398,7 @@ ttywait (struct timeval prev, struct timeval cur, double speed)
             case '1':
                 speed = 1.0;
                 break;
-/****** ObOlli *****/
             case '\033':    /* ESC starts a key sequence        */
-#define JUMPBASE 15         /* base of how much to jump, sec    */
-#define JUMP_SCALE 10       /* scaling for next bigger jump     */
                 read(STDIN_FILENO, &c2, 1); /* drain the next character */
                 switch (c2) {
                     case 'O':    /* for arrow keys (don't ask me)  */
@@ -388,6 +416,10 @@ ttywait (struct timeval prev, struct timeval cur, double speed)
                             case 'B':   /* down arrow   */
                                 seek_request.tv_sec += (speed * JUMPBASE * JUMP_SCALE);
                                 break;
+                            default:    /* unknown esc-O sequence  */
+#ifdef DEBUG                   
+                                fprintf(stderr, "*Error* got unimplemented ESC code O%c from keyboard\n", c);
+#endif                        
                         }
                         break;
                     case '[':    /* for PgUp, PgDown */
@@ -401,14 +433,13 @@ ttywait (struct timeval prev, struct timeval cur, double speed)
                                 break;
                         }
                         break;
-                    default:               /* unknown esc sequence  */ 
-                        // printf("Error: got keycode %d from keyboard", c);
-                        // exit(EXIT_FAILURE);      /* should never happen */
-                        break;
+                    default:               /* unknown esc-[ sequence  */ 
+#ifdef DEBUG                   
+                        fprintf(stderr, "*Error* got unimplemented ESC code [%c from keyboard\n", c);
+#endif                        
                 }
                 break;
         }
-/****** /ObOlli *****/            
         drift.tv_sec = drift.tv_usec = 0;
     } else {
 	    struct timeval stop;
@@ -491,13 +522,27 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
         Header h;
 
         if (read_func(fp, &h, &buf) == 0) {
-            break;
+            /* if we work with indexed files, switch to ->next */
+            if(index_head && current_file->next) {
+#ifdef DEBUG
+                struct timeval time_at_switch = time_elapsed;
+#endif
+                time_elapsed = current_file->time_elapsed_file;
+                current_file = current_file->next;
+#ifdef DEBUG
+                char *fn = basename(strdup(current_file->filename));
+                fprintf(stderr, "Opening next file %s, time changes from %.6fs to %.6fs\n\n", 
+                    fn, tv2f(time_at_switch), tv2f(time_elapsed));                
+#endif
+                freopen(current_file->filename, "r", fp);
+                assert(fp != NULL);
+                continue;
+            } else break;   /* EOF keywait will go here */
         }
 
         if (!first_time) {
             speed = wait_func(prev, h.tv, speed);
 
-/****** ObOlli *****/
             /* use index_head as flag we indeed have files to seek in */
             if (index_head != NULL && seek_request.tv_sec != 0) {
                 struct timeval seek_target = timeval_add(time_elapsed, seek_request);
@@ -505,14 +550,21 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     adjusts fp to point to this file/pos. 
                     returns timeval elapsed from start-of-all.          */
 #ifdef DEBUG
-                fprintf(stderr, "Seek of %lds requested at %.3f, seek_target is %.3fs\n", 
-                        seek_request.tv_sec, 
-                        (float)time_elapsed.tv_sec+(float)time_elapsed.tv_usec/1000000,
-                        (float)seek_target.tv_sec+(float)seek_target.tv_usec/1000000);
+                char *fn = basename(strdup(current_file->filename));
+                fprintf(stderr, "Seek %lds requested at %.3fs %ldb of %s, seek_target %.3fs\n", 
+                        seek_request.tv_sec, tv2f(time_elapsed),
+                        ftell(fp), fn, tv2f(seek_target));
+                struct stat stat_before, stat_after;
+                fstat(fp, &stat_before);
 #endif
                 time_elapsed = seek_file_index(fp, seek_target);
 #ifdef DEBUG
-                fprintf(stderr, "Position at beginning of clrscr record %lds\n", time_elapsed.tv_sec);
+                fprintf(stderr, "Position at clrscr record %lds\n", time_elapsed.tv_sec);
+                fstat(fp, &stat_after);
+                if(stat_before.st_ino == stat_after.st_ino)
+                    fprintf(stderr, "File seek did NOT change inode. BAD!\n");
+                else
+                    fprintf(stderr, "File seek DID change inode. Good.\n");
 #endif
                 /* Now we're to CLRSCR record start, next sub-CLRSCR seek   */
                 long int cur_pos = ftell(fp);  /* for reseeking back to start-of-record */
@@ -535,6 +587,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                             break;
                         }
                     }
+
                     cur_pos = ftell(fp);
                     time_elapsed = timeval_add(time_elapsed, time_diff);   /* where-we-are         */
                     write_func(buf, h.len);             /* output the record    */
@@ -547,12 +600,9 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
 #ifdef DEBUG
                 struct timeval offset = timeval_diff(seek_target, time_elapsed);
                 fprintf(stderr, "Seek complete at position %.3fs %ldb, offset %.3fs\n\n", 
-                        (float)time_elapsed.tv_sec + (float) time_elapsed.tv_usec/1000000,
-                        cur_pos,
-                        (float)offset.tv_sec + (float) offset.tv_usec/1000000);
+                        tv2f(time_elapsed), cur_pos, tv2f(offset));
 #endif
             }
-/****** /ObOlli *****/
             time_elapsed = timeval_add(time_elapsed, timeval_sub(h.tv, prev));
         }
         first_time = 0;
@@ -696,12 +746,13 @@ main (int argc, char **argv)
     }
 
     if (optind < argc) {
-        index_head = create_file_index(optind, argc, argv);
+        current_file = index_head = create_file_index(optind, argc, argv);
         time_elapsed.tv_sec = time_elapsed.tv_usec = 0;
 #ifdef DEBUG
-        fprintf(stderr, "Opening initial file %s\n", argv[optind]);
+        char *fn = basename(strdup(current_file->filename));
+        fprintf(stderr, "Opening initial file %s\n\n", fn);
 #endif                
-        input = efopen(argv[optind], "r");
+        input = efopen(current_file->filename, "r");
     } else {
         input = input_from_stdin();
         index_head = NULL;
@@ -718,20 +769,11 @@ main (int argc, char **argv)
     initcurses();
 #endif
     signal(SIGINT,interrupt);
-    if (index_head) {   /* we do have (indexed) file parms */
-        while (1) {
-            process(input, speed, read_func, wait_func);
-            if (++optind < argc) {
-#ifdef DEBUG
-                fprintf(stderr, "Opening next file %s\n\n", argv[optind]);
-#endif
-                freopen(argv[optind], "r", input);
-                assert(input != NULL);
-            } else break;
-        }
-    } else {            /* input from stream (like stdin)   */
-        process(input, speed, read_func, wait_func);
-    }
+    process(input, speed, read_func, wait_func);
+
+    if(index_head)
+        free_fileid(index_head);
+
 #ifdef USE_CURSES
     endwin();
 #else
