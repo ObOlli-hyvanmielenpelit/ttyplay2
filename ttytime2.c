@@ -118,7 +118,7 @@ int main(int argc, char **argv)
     for (i = 30; i; times[--i] = 0)
         ;
 
-    printf("Replay time of file(s) (sec, HH:mm:ss)\n");
+    printf("Replay time of file(s) (sec, HH:mm:ss) and number of records:\n");
     int total_seconds=0;
     for (i = 1; i < argc; i++)
     {
@@ -129,7 +129,7 @@ int main(int argc, char **argv)
         int hrs = (int)duration / 3600;
         int min = (int)(duration - hrs * 3600) / 60;
         int sec = duration - hrs * 3600 - min * 60;
-        printf("%7d	%d:%02d:%02d %d %s\n", duration, hrs, min, sec, records, filename);
+        printf("(%7d	%d:%02d:%02d) %d %s\n", duration, hrs, min, sec, records, filename);
         total_seconds += duration;
     }
     printf("%d file(s) analyzed.\n\n", argc-1);

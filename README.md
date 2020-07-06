@@ -1,5 +1,5 @@
 Improvements to ttyplay:
-* ttytime2 for extended reposting on ttyrec files
+* ttytime2 for extended reporting on ttyrec files
 * ttyplay2 indexed version of ttyplay for seeking
 
 Some files are just copies or extended versions of those in ttyplay,
