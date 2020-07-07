@@ -908,6 +908,26 @@ void ttypeek (FILE *fp, double speed,
     ttyplay(fp, speed, ttypread, ttywrite, ttynowait);
 }
 
+void
+help (void)
+{
+    printf("ttyplay2 is somewhat more advanced version of ttyplay, that understands\n");
+    printf("multiple files, and enables jumping and seeking within and between files\n");
+    printf("\n");
+    printf("Commands:\n");
+    printf("    q: quit:\n");
+    printf("    1: normal playback speed\n");
+    printf("        +: double current playback speed\n");
+    printf("        -: halve current playback speed\n");
+    printf("    p: pause:\n");
+    printf("    d/f: jump to previous/next file\n");
+    printf("    x/c: jump to previous/next CLRSCR\n");
+    printf("    back/forward arrow: seek %d seconds back/forward\n", JUMPBASE);    
+    printf("    up/down arrow: seek %d seconds back/forward\n", JUMPBASE*JUMP_SCALE);
+    printf("    PgUp/PgDown: seek %d seconds back/forward\n", JUMPBASE*JUMP_SCALE*JUMP_SCALE);
+    printf("    Home/End: jump to start/end of all files\n");
+    exit(0); /* it's OK */
+}
 
 void
 usage (void)
@@ -918,6 +938,7 @@ usage (void)
     printf("  -p       Peek another person's ttyrecord\n");
     printf("  -u       utf-8 mode (default: no)\n");
     printf("  -8       8-bit mode (opposite of utf8)\n");
+    printf("  -? or -h print help screen\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1005,7 +1026,7 @@ int main(int argc, char **argv)
 
     set_progname(argv[0]);
     while (1) {
-        int ch = getopt(argc, argv, "s:npu8");
+        int ch = getopt(argc, argv, "s:npu8?h");
         if (ch == EOF) {
             break;
         }
@@ -1031,6 +1052,10 @@ int main(int argc, char **argv)
         case '8':
             utf8_mode = 0;
             break;
+        case '?':
+        case 'h':
+            help();
+            break;  /* never taken */
         default:
             usage();
         }
