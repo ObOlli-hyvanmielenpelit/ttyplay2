@@ -47,11 +47,20 @@
 #include "io.h"
 
 #define DEBUG
+#undef DEBUG_INDEX  /* debug index creation */
+#undef DEBUG_SEEK   /* debug seeking by time offset */
+#define DEBUG_JUMP  /* debug jumping to next/prev file/clrscr */
+
 #ifdef DEBUG
 #include <libgen.h>
 #include <sys/stat.h>
 #endif
 
+#define FAIL 0
+#define SUCCESS 1
+/* time from clrscr record start till we switch back to its start
+    instead of the previous record. */
+#define SWITCH_LATENCY 10   /* seconds */
 #define JUMPBASE 15         /* base of how much to jump, sec    */
 #define JUMP_SCALE 10       /* scaling for next bigger jump     */
 #define BUFSIZE 8192        /* max record length (investigated length 4095) */
@@ -95,6 +104,18 @@ typedef void	(*ProcessFunc)	(FILE *fp, double speed,
 /* translate timeval to f */
 #define tv2f(tv) ((float) tv.tv_sec + (float) tv.tv_usec/1000000)
 #endif
+
+/* status of the program, init to zero for proper error behaviour 
+    NB, this *MUST* be changed if struct PControl changes! */
+static PControl status = {
+    NULL, NULL, /* working file: fp, current_fileid */
+    NULL,       /* index_head   */
+    NULL,       /* last clrscr  */
+    {0, 0},     /* timeval time_elapsed */
+    {0, 0},     /* timeval seek_request */
+    0,          /* position in-file */
+    1           /* print status lines? */
+};
 
 /* From glibc-2.2.3 (libc4.18) manual
   (https://ftp.gnu.org/old-gnu/Manuals/glibc-2.2.3/html_node/libc_418.html)
@@ -187,6 +208,15 @@ void free_fileid(File_ID *fileid_ptr)
     free(fileid_ptr);
 }
 
+/* update status structure */
+void update_status(Clrscr_ID *clrscr, int position, struct timeval time_elapsed)
+{
+    status.clrscr = clrscr;
+    status.position = position;
+    status.time_elapsed = time_elapsed;
+    status.current_fileid = status.clrscr->fileidx;
+}
+
 /* index_one_file returns length of file in timeval */
 struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
 {
@@ -198,7 +228,7 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
     int prev_was_cls = 0;
 
     prev_clrscr = NULL;
-#ifdef DEBUG
+#ifdef DEBUG_INDEX
     int iteration_count = 0;
     int cls_count = 0;
 #endif
@@ -206,7 +236,7 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
     while (1)
     {
         cur_record = ftell(fp);             /* to set start of current header */
-#ifdef DEBUG
+#ifdef DEBUG_INDEX
         iteration_count++;
 #endif
         int read_temp = read_header(fp, &cur_header);
@@ -234,7 +264,7 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
         /* here we have header and payload with CLRSCR */
         clrscr_pos = clrscr_loc - buf;      /* position of clrscr in buf    */
         cur_clrscr = (Clrscr_ID*) malloc(sizeof(Clrscr_ID));
-#ifdef DEBUG
+#ifdef DEBUG_INDEX
         fprintf(stderr, "CLRSCR malloc'd, record #%d at %db %.6fs\n", 
             iteration_count, cur_record, tv2f(where_we_are));
 #endif
@@ -257,7 +287,7 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
         /* for next iteration */
         prev_clrscr = cur_clrscr;
         prev_header = cur_header;
-#ifdef DEBUG
+#ifdef DEBUG_INDEX
         cls_count++;
 #endif
     }
@@ -267,7 +297,7 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
 
     efclose(fp);
 
-#ifdef DEBUG
+#ifdef DEBUG_INDEX
     fprintf(stderr, "file done at %.6fs, %d records.\n", 
         tv2f(where_we_are), iteration_count);
 #endif
@@ -287,7 +317,7 @@ File_ID * create_file_index(int start_arg, int argc, char **argv)
     for (argp = start_arg; argp < argc; argp++)
     {
         cur_fileid = (File_ID*) malloc(sizeof(File_ID));
-#ifdef DEBUG
+#ifdef DEBUG_INDEX
         char *fn = strdup(argv[argp]);
         fprintf(stderr, "\nFile_ID malloc'd for %s\n", basename(fn));
         free(fn);
@@ -306,42 +336,11 @@ File_ID * create_file_index(int start_arg, int argc, char **argv)
         cur_fileid->time_elapsed_file = whence_in_file;
         prev_file = cur_fileid;
     }
-#ifdef DEBUG
+#ifdef DEBUG_INDEX
     fprintf(stderr, "\n*** indexing complete *** \n\n");
 #endif
     return (first_file);
 }
-
-/********* refactoring, TBD put defs in proper places */
-
-#define FAIL 0
-#define SUCCESS 1
-/* time from clrscr record start till we switch back to its start
-    instead of the previous record. TBD.
-#define SWITCH_LATENCY 10 */
-
-/* Cf. init of `PControl status' if you change anything here */
-typedef struct PCONTROL     /* program control/status */
-{
-    FILE *fp;               /* file that we're working on */
-    File_ID *current_fileid;
-    File_ID *index_head;
-    Clrscr_ID *clrscr;      /* last CLRSCR switched to */
-    struct timeval time_elapsed;
-    struct timeval seek_request;
-    long int position;      /* within FILE above, bytes */
-} PControl;
-
-/* status of the program, init to zero for proper error behaviour 
-    NB, this *MUST* be changed if struct PControl changes! */
-static PControl status = {
-    NULL, NULL, /* working file: fp, current_fileid */
-    NULL,       /* index_head   */
-    NULL,       /* last clrscr  */
-    {0, 0},     /* timeval time_elapsed */
-    {0, 0},     /* timeval seek_request */
-    0           /* position in-file */
-};
 
 /* switch to whicever file asked. does not update status.clrscr, 
     that's the duty of the caller.
@@ -374,14 +373,74 @@ int switch_to_file(File_ID *target)
     return SUCCESS;
 }
 
-/* switch_clrscr gets parameter of how many'th to jump to, sign indicates direction
-    NB. returns zero on success, how many were not moved over to on fail. 
-    Be wary: this is somewhat counterintuitive error behaviour. */ 
-int switch_clrscr(int direction) 
+/* jump_next_file gets parameter of how many'th to jump to, sign 
+    indicates direction. 
+    NB. returns zero on success, how many were not moved over 
+    to on fail. Be wary: this is somewhat counterintuitive 
+    error behaviour. */ 
+int jump_next_file(int direction)
 {
+    if(direction < 0) {
+        if(status.current_fileid->prev == status.current_fileid)
+            /* already at first file */
+            return(direction);
+        else {
+            status.current_fileid = status.current_fileid->prev;
+            direction = jump_next_file(direction+1);
+        }
+    }
+
+    if(direction > 0) {
+        if(status.current_fileid->next == NULL)
+            /* we're at last file */
+            return(direction);
+        else {
+            status.current_fileid = status.current_fileid->next;
+            direction = jump_next_file(direction-1);
+        }
+    }
+
+    return(direction);
+}
+
+/* special case the first file jump, to allow for SWITCH_LATENCY */
+int jump_file(int direction)
+{
+    /* first make sure we're running on indexed files */
     if(!status.index_head)
         return direction;   /* fail, nothing done */
 
+    /* add -1 if seeking back */
+    if (direction < -1) {
+        direction++;   /* we actually jump one less backwards */ 
+#ifdef DEBUG_JUMP
+        char *fp = strdup(status.current_fileid->filename);
+        fprintf(stderr, "File jump of %d requested, file %s\n", 
+                direction, basename(fp));
+        free(fp);
+#endif
+        int delta = timeval_sub(status.time_elapsed, 
+                                status.current_fileid->time_elapsed_file).tv_sec;
+        delta -= SWITCH_LATENCY;
+        /* and one more time elapsed from SOF is less than SWITCH_LATENCY */
+        if(delta < 0) { 
+            direction--;
+#ifdef DEBUG_JUMP
+            fprintf(stderr, "...and to prev file since we're near SOF.\n");
+#endif
+        }
+    }
+    /* jump the n'th file by recursion as requested */ 
+    direction = jump_next_file(direction);
+    if(!switch_to_file(status.current_fileid))
+        exit(EXIT_FAILURE); /* should not happen */
+    return(direction);
+}
+
+/* see comments on jump*file above, we just work with Clrscr_ID, 
+    not File_ID. */
+int jump_clrscr(int direction) 
+{
     if(direction < 0) {
         if(status.clrscr->prev == status.clrscr) {
             /* first clrscr of file */
@@ -392,7 +451,7 @@ int switch_clrscr(int direction)
             status.clrscr = status.clrscr->prev;
         }
         /* jumping on implemented as recursion, non-zero return means S/EOF */
-        if(switch_clrscr(direction+1) != 0)
+        if(jump_clrscr(direction+1) != 0)
             return direction;
     }
 
@@ -402,20 +461,13 @@ int switch_clrscr(int direction)
                 return direction;
             status.clrscr = status.current_fileid->first_clrscr;
         } else {
-            status.clrscr = status.clrscr-> next;
+            status.clrscr = status.clrscr->next;
         }
-        if(switch_clrscr(direction-1) != 0)
+        if(jump_clrscr(direction-1) != 0)
             return direction;            
     }
-    return 0;  /* success */
-}
 
-/* update status structure */
-void update_status(Clrscr_ID *clrscr, int position, struct timeval time_elapsed)
-{
-    status.clrscr = clrscr;
-    status.position = position;
-    status.time_elapsed = time_elapsed;
+    return(direction);  /* success */
 }
 
 /* seek_file_index sets struct status to correct file and header position.
@@ -427,7 +479,7 @@ int seek_file_index(struct timeval seek_target)
     Clrscr_ID *cur_clrscr;
     struct timeval when_we_are;
 
-#ifdef DEBUG
+#ifdef DEBUG_SEEK
     fprintf(stderr, "Seeking from %lds to %lds\n",
                     status.time_elapsed.tv_sec, seek_target.tv_sec);
 #endif
@@ -445,7 +497,7 @@ int seek_file_index(struct timeval seek_target)
         cur_fileid = cur_fileid->next;
     }    
 
-#ifdef DEBUG
+#ifdef DEBUG_SEEK
     char *fn = strdup(cur_fileid->filename);
     fprintf(stderr, "seek_file_index: found file %s ranging %lds through %lds\n", 
             basename(fn), 
@@ -463,7 +515,7 @@ int seek_file_index(struct timeval seek_target)
         cur_clrscr = cur_clrscr->next;
     }
 
-#ifdef DEBUG
+#ifdef DEBUG_SEEK
     fprintf(stderr, "seek_file_index: found clrscr at %ldb ranging %.6fs through ", 
             cur_clrscr->record_start, 
             cur_clrscr->prev == cur_clrscr ? 
@@ -476,7 +528,7 @@ int seek_file_index(struct timeval seek_target)
 #endif
 
     /* switch fp to whichever file/record the index points to */
-#ifdef DEBUG
+#ifdef DEBUG_SEEK
     fn = strdup(cur_fileid->filename);
     fprintf(stderr, "seek_file_index: switching to file %s\n", basename(fn));
     free(fn);
@@ -503,9 +555,7 @@ ttywait (struct timeval prev, struct timeval cur, double speed, int *key)
     gettimeofday(&start, NULL);
 
     /* pause is coded into speed as negative value; 
-        absolute value tell us what speed was, for resuming
-            *** WIP ***/
-
+        absolute value tell us what speed was, for resuming */
     assert(speed != 0);
     diff = timeval_diff(drift, 
         timeval_div(diff, 
@@ -721,25 +771,38 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
             speed = wait_func(prev, h.tv, speed, &key);
 
             int result = 0;
-#ifdef DEBUG
-            struct timeval tdelta = timeval_diff(prev, h.tv);
-#endif
             switch(key) {       /* keycode passed us by ttywait()? */
                 case 0:         /* none */
                     break;
                 case 'q':
                     return;     /* quit */
                 case 'f':
-                    switch_to_file(status.current_fileid->next);
+                    result = jump_file(+1);
+#ifdef DEBUG_JUMP
+                    if(result != 0)
+                       fprintf(stderr, "FYI: file jump +1 returned %d\n", result);
+#endif
                     break;
                 case 'd':
-                    switch_to_file(status.current_fileid->prev);
+                    result = jump_file(-1);
+#ifdef DEBUG_JUMP
+                    if(result != 0)
+                        fprintf(stderr, "FYI: file jump -1 returned %d\n", result);
+#endif
                     break;
                 case 'c':
-                    result = switch_clrscr(+1);
+                    result = jump_clrscr(+1);
+#ifdef DEBUG_JUMP
+                    if(result != 0)
+                        fprintf(stderr, "FYI: clrscr jump +1 returned %d\n", result);
+#endif
                     break;
                 case 'x':
-                    result = switch_clrscr(-1);
+                    result = jump_clrscr(-1);
+#ifdef DEBUG_JUMP
+                    if(result != 0)
+                        fprintf(stderr, "FYI: clrscr jump -1 returned %d\n", result);
+#endif
                     break;
                 default:
 #ifdef DEBUG
@@ -747,13 +810,6 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
 #endif
                 break;
             }
-#ifdef DEBUG
-            /* returned by switch_clrscr; just spit it out since, for now, 
-                there's no need for action when we try to seek beyond 
-                start/end of the fileset */
-            if(result != 0)
-                fprintf(stderr, "FYI: clrscr seek returned %d\n", result);
-#endif
 
             /* use index_head as flag we indeed have files to seek in */
             if (status.index_head != NULL && status.seek_request.tv_sec != 0) {
@@ -762,7 +818,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                 /* seek_file_index seeks header preceding CLRSCR and 
                     adjusts status.fp to point to this file/pos. 
                     returns timeval elapsed from start-of-all.          */
-#ifdef DEBUG
+#ifdef DEBUG_SEEK
                 char *fn = strdup(status.current_fileid->filename);
                 fprintf(stderr, "Seek %lds requested at %.3fs %ldb of %s, seek_target %.3fs\n", 
                         status.seek_request.tv_sec, tv2f(status.time_elapsed),
@@ -773,7 +829,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
 #endif
                 if(! seek_file_index(seek_target))
                     exit(EXIT_FAILURE);     /* TBD: add msg like "seek failed" */
-#ifdef DEBUG
+#ifdef DEBUG_SEEK
                 fprintf(stderr, "Position at clrscr record %lds\n", status.time_elapsed.tv_sec);
                 fstat(status.fp, &stat_after);
                 if(stat_before.st_ino == stat_after.st_ino)
@@ -793,7 +849,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                         time_diff = timeval_diff(prev, h.tv);
                         if (timeval_sub(seek_target, 
                                 timeval_add(status.time_elapsed, time_diff)).tv_sec < 0) {
-#ifdef DEBUG                            
+#ifdef DEBUG_SEEK
                             fprintf(stderr, "Quitting seek: next step would go into future by %lds\n",
                                 -(timeval_sub(seek_target,
                                 timeval_add(status.time_elapsed, time_diff)).tv_sec));
@@ -812,7 +868,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                    preceding recordfp & clear seek pos/flag         */
                 fseek(fp, cur_pos, SEEK_SET);
                 status.seek_request.tv_sec = status.seek_request.tv_usec = 0;   /* seek all done    */
-#ifdef DEBUG
+#ifdef DEBUG_SEEK
                 struct timeval offset = timeval_diff(seek_target, status.time_elapsed);
                 fprintf(stderr, "Seek complete at position %.3fs %ldb, offset %.3fs\n\n", 
                         tv2f(status.time_elapsed), cur_pos, tv2f(offset));
@@ -910,12 +966,12 @@ initcurses (int utf8_mode)
 
   if (utf8_mode) {
 #ifdef DEBUG
-    fprintf(stderr, "echoing `set UTF-8 mode' (esc-%G) to term.\n\n");
+    fprintf(stderr, "echoing `set UTF-8 mode' (esc-%%G) to term.\n\n");
 #endif /* DEBUG */
     (void) write(1, "\033%G", 3);   /* select UTF-8 charset */
   } else {
 #ifdef DEBUG
-    fprintf(stderr, "echoing `set 8-bit mode' (non-UTF8, esc-%@) to term.\n\n");
+    fprintf(stderr, "echoing `set 8-bit mode' (non-UTF8, esc-%%@) to term.\n\n");
 #endif /* DEBUG */
     (void) write(1, "\033%@", 3);   /* iso646/iso8859-1 */
   }

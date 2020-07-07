@@ -28,4 +28,16 @@ typedef struct CLRSCRID
     struct CLRSCRID *next;
 } Clrscr_ID;
 
+typedef struct PCONTROL     /* program control/status */
+{
+    FILE *fp;               /* file that we're working on */
+    File_ID *current_fileid;
+    File_ID *index_head;
+    Clrscr_ID *clrscr;      /* last CLRSCR switched to */
+    struct timeval time_elapsed;
+    struct timeval seek_request;
+    long int position;      /* within FILE above, bytes */
+    int statusflag;         /* do we print status msg? */
+} PControl;
+
 #endif
