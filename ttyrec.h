@@ -20,7 +20,7 @@ typedef struct FILEID
 } File_ID;
 typedef struct CLRSCRID
 {
-    struct FILEID *fileidx;
+    struct FILEID *file_id;
     long int record_start; /* within file */
     long int position;     /* within file */
     struct timeval time_elapsed_cls; /* tv since start of all files at end */

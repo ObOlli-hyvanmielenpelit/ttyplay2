@@ -213,7 +213,7 @@ void update_status(Clrscr_ID *clrscr, int position, struct timeval time_elapsed)
     status.clrscr = clrscr;
     status.position = position;
     status.time_elapsed = time_elapsed;
-    status.current_fileid = status.clrscr->fileidx;
+    status.current_fileid = status.clrscr->file_id;
     /* update fp, too */
     fseek(status.fp, status.position, SEEK_SET);
 }
@@ -269,16 +269,21 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
         fprintf(stderr, "CLRSCR malloc'd, record #%d at %db %.6fs\n", 
             iteration_count, cur_record, tv2f(where_we_are));
 #endif
-        if (prev_clrscr == NULL) 
-            prev_clrscr = first_clrscr = cur_clrscr;        /* first record of file */
-
-        /* update where_we_are to end of record, then update time_elapsed_cls    */
+        /* chain first clrscr to last file's last */
+        if (prev_clrscr == NULL) {          /* first record of file */
+            if(file_id->prev != file_id) {  /* not first file of the set */
+                prev_clrscr = file_id->prev->last_clrscr;
+                file_id->prev->last_clrscr->next = cur_clrscr;
+            }
+            /* in any case, this is the first clrscr of this file */
+            first_clrscr = cur_clrscr;
+        }
 
         /* update of the rest of cur_clrscr is straightforward     */
         cur_clrscr->prev = prev_clrscr;
         prev_clrscr->next = cur_clrscr;
         cur_clrscr->next = NULL;
-        cur_clrscr->fileidx = file_id;
+        cur_clrscr->file_id = file_id;
         cur_clrscr->record_start = cur_record;              /* pointer into file    */
         cur_clrscr->position = cur_record + sizeof(cur_header) + clrscr_pos;
 
@@ -472,7 +477,7 @@ int jump_clrscr(int direction)
 
     if(direction < 0) {
         if(status.clrscr->prev == status.clrscr) {  /* SOF */
-            if(!switch_to_file(status.clrscr->fileidx->prev))
+            if(!switch_to_file(status.clrscr->file_id->prev))
                 return direction;   /* no previous file */
             status.clrscr = status.current_fileid->last_clrscr;
         } else {
@@ -485,7 +490,7 @@ int jump_clrscr(int direction)
 
     if(direction > 0) {     /* mirror of the above */
         if(status.clrscr->next == NULL) {           /* EOF */
-            if(!switch_to_file(status.clrscr->fileidx->next))
+            if(!switch_to_file(status.clrscr->file_id->next))
                 return direction;   /* no next file */
             status.clrscr = status.current_fileid->first_clrscr;
         } else {
@@ -547,7 +552,7 @@ int seek_file_index(struct timeval seek_target)
     fprintf(stderr, "seek_file_index: found clrscr at %ldb ranging %.6fs through ", 
             cur_clrscr->record_start, 
             cur_clrscr->prev == cur_clrscr ? 
-                tv2f(cur_clrscr->fileidx->prev->time_elapsed_file) : 
+                tv2f(cur_clrscr->file_id->prev->time_elapsed_file) : 
                 tv2f(cur_clrscr->prev->time_elapsed_cls));
     if(cur_clrscr->next == NULL) 
         fprintf(stderr, "EOF\n");
