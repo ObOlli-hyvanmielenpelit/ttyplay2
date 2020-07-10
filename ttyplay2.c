@@ -113,8 +113,7 @@ static PControl status = {
     NULL,       /* last clrscr  */
     {0, 0},     /* timeval time_elapsed */
     {0, 0},     /* timeval seek_request */
-    0,          /* position in-file */
-    1           /* print status lines? */
+    0           /* position in-file */
 };
 
 /* From glibc-2.2.3 (libc4.18) manual
@@ -215,6 +214,8 @@ void update_status(Clrscr_ID *clrscr, int position, struct timeval time_elapsed)
     status.position = position;
     status.time_elapsed = time_elapsed;
     status.current_fileid = status.clrscr->fileidx;
+    /* update fp, too */
+    fseek(status.fp, status.position, SEEK_SET);
 }
 
 /* index_one_file returns length of file in timeval */
@@ -243,7 +244,7 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
         if (read_temp  == 0)                /* read the header  */
             break;                          /* EOF              */
         if (cur_header.len > BUFSIZE) {
-            printf("Record payload of %d exceeds buffer size %d. Exiting.", 
+            printf("Record payload of %d exceeds buffer size %d. This is fatal, exiting.", 
                    cur_header.len, BUFSIZE);
             exit(EXIT_FAILURE);
         }
@@ -410,8 +411,10 @@ int jump_file(int direction)
     if(!status.index_head)
         return direction;   /* fail, nothing done */
 
-    /* add -1 if seeking back */
-    if (direction < -1) {
+    /* add 1 if seeking back, to make first case that of beginning 
+        of the current file. Note that this has to precede the case
+        of direction == 0, to effect that particular case. */
+    if (direction < 0) {
         direction++;   /* we actually jump one less backwards */ 
 #ifdef DEBUG_JUMP
         char *fp = strdup(status.current_fileid->filename);
@@ -430,10 +433,33 @@ int jump_file(int direction)
 #endif
         }
     }
+
+    if(direction == 0) {
+        /* we jump to start of the file. update status and fp,
+            then return without jumping on */
+        update_status(status.current_fileid->first_clrscr, 0, 
+            status.current_fileid->prev == status.current_fileid ?
+                (struct timeval) {0, 0} : 
+                status.current_fileid->prev->time_elapsed_file);
+        return(0);
+    }
+
     /* jump the n'th file by recursion as requested */ 
     direction = jump_next_file(direction);
     if(!switch_to_file(status.current_fileid))
         exit(EXIT_FAILURE); /* should not happen */
+    
+    struct timeval time_elapsed;
+    if(status.current_fileid->prev == status.current_fileid)
+        time_elapsed.tv_sec = time_elapsed.tv_usec = 0;
+    else
+        time_elapsed = status.current_fileid->prev->time_elapsed_file;
+
+    update_status(status.current_fileid->first_clrscr, 0, 
+        status.current_fileid->prev == status.current_fileid ?
+            (struct timeval) {0, 0} : 
+            status.current_fileid->prev->time_elapsed_file);
+
     return(direction);
 }
 
@@ -441,9 +467,11 @@ int jump_file(int direction)
     not File_ID. */
 int jump_clrscr(int direction) 
 {
+    /* WIP: we can't really trust status.clrscr is up to date, since the normal
+        operation is just pulling stuff from file and pushing it to screen */
+
     if(direction < 0) {
-        if(status.clrscr->prev == status.clrscr) {
-            /* first clrscr of file */
+        if(status.clrscr->prev == status.clrscr) {  /* SOF */
             if(!switch_to_file(status.clrscr->fileidx->prev))
                 return direction;   /* no previous file */
             status.clrscr = status.current_fileid->last_clrscr;
@@ -456,9 +484,9 @@ int jump_clrscr(int direction)
     }
 
     if(direction > 0) {     /* mirror of the above */
-        if(status.clrscr->next == NULL) {
+        if(status.clrscr->next == NULL) {           /* EOF */
             if(!switch_to_file(status.clrscr->fileidx->next))
-                return direction;
+                return direction;   /* no next file */
             status.clrscr = status.current_fileid->first_clrscr;
         } else {
             status.clrscr = status.clrscr->next;
@@ -537,12 +565,9 @@ int seek_file_index(struct timeval seek_target)
     if(!switch_to_file(status.current_fileid))
         return FAIL;
     update_status(cur_clrscr, cur_clrscr->record_start, when_we_are);
-    fseek(status.fp, cur_clrscr->record_start, SEEK_SET);
     /* the elapsed time is found at end of previous clrscr */
     return SUCCESS;
 }   
-
-/********* /refactoring */
 
 double
 ttywait (struct timeval prev, struct timeval cur, double speed, int *key)
@@ -587,11 +612,9 @@ ttywait (struct timeval prev, struct timeval cur, double speed, int *key)
         read(STDIN_FILENO, &c, 1); /* drain the character */
         switch (c) {
             case '+':
-/*            case 'f':     /* f has been hijacked for next_file */
                 speed *= 2;
                 break;
             case '-':
-/*            case 's':     /* s removed for symmetry with f above */
                 speed /= 2;
                 break;
             case '1':
@@ -727,6 +750,20 @@ ttynowrite (char *buf, int len)
     /* do nothing */
 }
 
+/* get timeval of the header pointed to status.fp */
+struct timeval get_header_time(ReadFunc read_func)
+{
+    Header h;
+    char *buf;
+    /* make sure we know where to go back to */
+    status.position = ftell(status.fp);
+    if(!read_func(status.fp, &h, &buf))
+        exit(FAIL); /* TBD(?): not prepared for EOF */
+    free(buf);  /* we don't need the playload for anything, really */
+    fseek(status.fp, status.position, SEEK_SET);  /* seek back */
+    return(h.tv);
+}
+
 void
 ttyplay (FILE *fp, double speed, ReadFunc read_func, 
 	 WriteFunc write_func, WaitFunc wait_func)
@@ -752,16 +789,20 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
 #ifdef DEBUG
                 struct timeval time_at_switch = status.time_elapsed;
 #endif
-                status.time_elapsed = status.current_fileid->time_elapsed_file;
                 status.current_fileid = status.current_fileid->next;
+                freopen(status.current_fileid->filename, "r", status.fp);
+                assert(status.fp != NULL);
+                update_status(status.current_fileid->first_clrscr, 0, 
+                    status.current_fileid->prev == status.current_fileid ?
+                        (struct timeval) {0, 0} :
+                        status.current_fileid->prev->time_elapsed_file);
 #ifdef DEBUG
                 char *fn = strdup(status.current_fileid->filename);
-                fprintf(stderr, "Opening next file %s, time changes from %.6fs to %.6fs\n\n", 
+                fprintf(stderr, "Opening %s, time changes from %.6fs to %.6fs\n\n", 
                     basename(fn), tv2f(time_at_switch), tv2f(status.time_elapsed));
                 free(fn);            
 #endif
-                freopen(status.current_fileid->filename, "r", status.fp);
-                assert(status.fp != NULL);
+                free(buf);
                 continue;
             }
         } /* TBD: else wait for keypress before quit*/
@@ -778,13 +819,15 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     return;     /* quit */
                 case 'f':
                     result = jump_file(+1);
+                    h.tv = get_header_time(read_func);
 #ifdef DEBUG_JUMP
                     if(result != 0)
-                       fprintf(stderr, "FYI: file jump +1 returned %d\n", result);
+                       fprintf(stderr, "FTI: file jump +1 returned %d\n", result);
 #endif
                     break;
                 case 'd':
                     result = jump_file(-1);
+                    h.tv = get_header_time(read_func);
 #ifdef DEBUG_JUMP
                     if(result != 0)
                         fprintf(stderr, "FYI: file jump -1 returned %d\n", result);
@@ -792,6 +835,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     break;
                 case 'c':
                     result = jump_clrscr(+1);
+                    h.tv = get_header_time(read_func);
 #ifdef DEBUG_JUMP
                     if(result != 0)
                         fprintf(stderr, "FYI: clrscr jump +1 returned %d\n", result);
@@ -799,6 +843,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     break;
                 case 'x':
                     result = jump_clrscr(-1);
+                    h.tv = get_header_time(read_func);
 #ifdef DEBUG_JUMP
                     if(result != 0)
                         fprintf(stderr, "FYI: clrscr jump -1 returned %d\n", result);
