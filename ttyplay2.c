@@ -269,27 +269,32 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
         fprintf(stderr, "CLRSCR malloc'd, record #%d at %db %.6fs\n", 
             iteration_count, cur_record, tv2f(where_we_are));
 #endif
+
+/********* WIP */
+        /* update trivial fields */
+        cur_clrscr->file_id = file_id;
+
         /* chain first clrscr to last file's last */
-        if (prev_clrscr == NULL) {          /* first record of file */
+        if (prev_clrscr == NULL) {          /* first clrscr of file */
             if(file_id->prev != file_id) {  /* not first file of the set */
                 prev_clrscr = file_id->prev->last_clrscr;
                 file_id->prev->last_clrscr->next = cur_clrscr;
-            }
-            /* in any case, this is the first clrscr of this file */
-            first_clrscr = cur_clrscr;
+            } /* for first file of the set, prev_clrscr == NULL is fine */
+        } else {
+        /* else just chain us in current file's chain */
+            cur_clrscr->prev = prev_clrscr;
+            prev_clrscr->next = cur_clrscr;
+            /* update previous clrscr's time_elapsed, too */
+            cur_clrscr->prev->time_elapsed_cls = where_we_are;
         }
 
-        /* update of the rest of cur_clrscr is straightforward     */
-        cur_clrscr->prev = prev_clrscr;
-        prev_clrscr->next = cur_clrscr;
+        /* init of the rest of cur_clrscr is straightforward */
         cur_clrscr->next = NULL;
         cur_clrscr->file_id = file_id;
         cur_clrscr->record_start = cur_record;              /* pointer into file    */
         cur_clrscr->position = cur_record + sizeof(cur_header) + clrscr_pos;
 
-        /* update prev_clrscr ending time if not first clrscr*/
-        if(cur_clrscr->prev != cur_clrscr)
-            cur_clrscr->prev->time_elapsed_cls = where_we_are;
+        /* update prev_clrscr ending time */
         /* for next iteration */
         prev_clrscr = cur_clrscr;
         prev_header = cur_header;
@@ -503,11 +508,10 @@ int jump_clrscr(int direction)
     return(direction);  /* success */
 }
 
-/* seek_file_index sets struct status to correct file and header position.
+/* seek_index sets struct status to correct file and header position.
     returns FAIL/SUCCESS */
-int seek_file_index(struct timeval seek_target)
+int seek_index(struct timeval seek_target)
 {
-    /* static File_ID *index_head; */
     File_ID *cur_fileid;
     Clrscr_ID *cur_clrscr;
     struct timeval when_we_are;
@@ -516,54 +520,31 @@ int seek_file_index(struct timeval seek_target)
     fprintf(stderr, "Seeking from %lds to %lds\n",
                     status.time_elapsed.tv_sec, seek_target.tv_sec);
 #endif
-    cur_fileid = status.index_head;
 
-    /* First find the correct file, begin by init when_we_are just in case */
-    if (cur_fileid->prev == cur_fileid)     /* special case first file */
-        when_we_are.tv_sec = when_we_are.tv_usec = 0;
-    else
-        when_we_are = cur_fileid->prev->time_elapsed_file;
-
-    while (timeval_diff(cur_fileid->time_elapsed_file, seek_target).tv_sec >=0 &&
-            cur_fileid->next != NULL) {
-        when_we_are = cur_fileid->time_elapsed_file;
-        cur_fileid = cur_fileid->next;
-    }    
-
-#ifdef DEBUG_SEEK
-    char *fn = strdup(cur_fileid->filename);
-    fprintf(stderr, "seek_file_index: found file %s ranging %lds through %lds\n", 
-            basename(fn), 
-            cur_fileid->prev == cur_fileid ? 0 : cur_fileid->prev->time_elapsed_file.tv_sec,
-            cur_fileid->time_elapsed_file.tv_sec);
-    free(fn);
-#endif
-
-    /* Now find the CLRSCR preceding seekpoint  */
-    cur_clrscr = cur_fileid->first_clrscr;
-    /* when_we_are is already correct for first iteration */ 
-    while (timeval_diff(cur_clrscr->time_elapsed_cls, seek_target).tv_sec >=0 &&
-            cur_clrscr->next != NULL) {
-        when_we_are = cur_clrscr->time_elapsed_cls;
+    /* since clrscr_id is chained from beginning to end, all we need
+        is find the correct one */
+    cur_clrscr = status.index_head->first_clrscr;
+    while(timeval_diff(seek_target, cur_clrscr->time_elapsed_cls).tv_sec >= 0 &&
+            cur_clrscr->next != NULL)
         cur_clrscr = cur_clrscr->next;
-    }
 
 #ifdef DEBUG_SEEK
-    fprintf(stderr, "seek_file_index: found clrscr at %ldb ranging %.6fs through ", 
+    fprintf(stderr, "seek_index: found clrscr at %ldb ranging %.6fs through ", 
             cur_clrscr->record_start, 
             cur_clrscr->prev == cur_clrscr ? 
                 tv2f(cur_clrscr->file_id->prev->time_elapsed_file) : 
                 tv2f(cur_clrscr->prev->time_elapsed_cls));
     if(cur_clrscr->next == NULL) 
-        fprintf(stderr, "EOF\n");
+        fprintf(stderr, "the end\n");
     else 
         fprintf(stderr, "%.6f\n", tv2f(cur_clrscr->time_elapsed_cls));
 #endif
 
     /* switch fp to whichever file/record the index points to */
+    cur_fileid = cur_clrscr->file_id;
 #ifdef DEBUG_SEEK
     fn = strdup(cur_fileid->filename);
-    fprintf(stderr, "seek_file_index: switching to file %s\n", basename(fn));
+    fprintf(stderr, "seek_index: switching to file %s\n", basename(fn));
     free(fn);
 #endif
     status.current_fileid = cur_fileid;        /* propagate result upwards */
@@ -755,7 +736,7 @@ ttynowrite (char *buf, int len)
     /* do nothing */
 }
 
-/* get timeval of the header pointed to status.fp */
+/* get timeval of the header pointed to by status.fp */
 struct timeval get_header_time(ReadFunc read_func)
 {
     Header h;
@@ -865,7 +846,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
             if (status.index_head != NULL && status.seek_request.tv_sec != 0) {
                 struct timeval seek_target = 
                     timeval_add(status.time_elapsed, status.seek_request);
-                /* seek_file_index seeks header preceding CLRSCR and 
+                /* seek_index seeks header preceding CLRSCR and 
                     adjusts status.fp to point to this file/pos. 
                     returns timeval elapsed from start-of-all.          */
 #ifdef DEBUG_SEEK
@@ -877,7 +858,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                 struct stat stat_before, stat_after;
                 fstat(status.fp, &stat_before);
 #endif
-                if(! seek_file_index(seek_target))
+                if(! seek_index(seek_target))
                     exit(EXIT_FAILURE);     /* TBD: add msg like "seek failed" */
 #ifdef DEBUG_SEEK
                 fprintf(stderr, "Position at clrscr record %lds\n", status.time_elapsed.tv_sec);
@@ -965,7 +946,7 @@ help (void)
     printf("multiple files, and enables jumping and seeking within and between files\n");
     printf("\n");
     printf("Commands:\n");
-    printf("    q: quit:\n");
+    printf("    q: quit\n");
     printf("    1: normal playback speed\n");
     printf("        +: double current playback speed\n");
     printf("        -: halve current playback speed\n");
