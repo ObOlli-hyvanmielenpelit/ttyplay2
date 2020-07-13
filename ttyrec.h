@@ -14,7 +14,6 @@ typedef struct FILEID
     char *filename;
     struct FILEID *prev;
     struct FILEID *next;
-    struct timeval time_elapsed_file; /* tv since start of all files at end */
     struct CLRSCRID *first_clrscr;
     struct CLRSCRID *last_clrscr;
 } File_ID;

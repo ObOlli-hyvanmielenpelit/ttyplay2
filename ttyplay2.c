@@ -47,9 +47,9 @@
 #include "io.h"
 
 #define DEBUG
-#undef DEBUG_INDEX  /* debug index creation */
-#undef DEBUG_SEEK   /* debug seeking by time offset */
-#define DEBUG_JUMP  /* debug jumping to next/prev file/clrscr */
+#define DEBUG_INDEX  /* debug index creation */
+#define DEBUG_SEEK   /* debug seeking by time offset */
+#undef DEBUG_JUMP  /* debug jumping to next/prev file/clrscr */
 
 #ifdef DEBUG
 #include <libgen.h>
@@ -219,13 +219,13 @@ void update_status(Clrscr_ID *clrscr, int position, struct timeval time_elapsed)
 }
 
 /* index_one_file returns length of file in timeval */
-struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
+struct timeval index_one_file(File_ID *file_id, struct timeval whence_in_cls)
 {
     int cur_record, bytes_read, clrscr_pos;
     FILE *fp = efopen(file_id->filename, "r");
     Header cur_header, prev_header;
     char buf[BUFSIZE+1], *clrscr_loc; /* leave space in buf for null */
-    Clrscr_ID *first_clrscr, *prev_clrscr, *cur_clrscr;
+    Clrscr_ID *prev_clrscr, *cur_clrscr;
     int prev_was_cls = 0;
 
     prev_clrscr = NULL;
@@ -240,9 +240,8 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
 #ifdef DEBUG_INDEX
         iteration_count++;
 #endif
-        int read_temp = read_header(fp, &cur_header);
-        if (read_temp  == 0)                /* read the header  */
-            break;                          /* EOF              */
+        if (read_header(fp, &cur_header) == 0)      /* read the header  */
+            break;                                  /* EOF              */
         if (cur_header.len > BUFSIZE) {
             printf("Record payload of %d exceeds buffer size %d. This is fatal, exiting.", 
                    cur_header.len, BUFSIZE);
@@ -254,7 +253,7 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
         bytes_read = fread(buf, sizeof(char), cur_header.len, fp); /* record payload*/
         buf[bytes_read] = 0;                                /* for strstr, need it? */
         /* keep track of time, for each and every record    */
-        where_we_are = timeval_add(where_we_are, 
+        whence_in_cls = timeval_add(whence_in_cls, 
                     timeval_sub(cur_header.tv, prev_header.tv));
 
         if (!(clrscr_loc = strstr(buf, CLRSCR))) {
@@ -267,25 +266,25 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
         cur_clrscr = (Clrscr_ID*) malloc(sizeof(Clrscr_ID));
 #ifdef DEBUG_INDEX
         fprintf(stderr, "CLRSCR malloc'd, record #%d at %db %.6fs\n", 
-            iteration_count, cur_record, tv2f(where_we_are));
+            iteration_count, cur_record, tv2f(whence_in_cls));
 #endif
 
-/********* WIP */
-        /* update trivial fields */
+        /* update uplink to file*/
         cur_clrscr->file_id = file_id;
 
         /* chain first clrscr to last file's last */
         if (prev_clrscr == NULL) {          /* first clrscr of file */
-            if(file_id->prev != file_id) {  /* not first file of the set */
+            if(file_id->prev != NULL) {  /* not first file of the set */
                 prev_clrscr = file_id->prev->last_clrscr;
-                file_id->prev->last_clrscr->next = cur_clrscr;
-            } /* for first file of the set, prev_clrscr == NULL is fine */
-        } else {
-        /* else just chain us in current file's chain */
+                prev_clrscr->next = cur_clrscr;
+                prev_clrscr->time_elapsed_cls = whence_in_cls;
+            } /* else: for first clrscr of first file, NULL is just fine */
+            file_id->first_clrscr = cur_clrscr;
+        } else {            /* just chain us in current file's chain */
             cur_clrscr->prev = prev_clrscr;
             prev_clrscr->next = cur_clrscr;
             /* update previous clrscr's time_elapsed, too */
-            cur_clrscr->prev->time_elapsed_cls = where_we_are;
+            prev_clrscr->time_elapsed_cls = whence_in_cls;
         }
 
         /* init of the rest of cur_clrscr is straightforward */
@@ -303,19 +302,20 @@ struct timeval index_one_file(File_ID *file_id, struct timeval where_we_are)
 #endif
     }
     /* update file_id relevant fields   */
-    file_id->first_clrscr = first_clrscr;
     file_id->last_clrscr = cur_clrscr;
 
     efclose(fp);
 
 #ifdef DEBUG_INDEX
     fprintf(stderr, "file done at %.6fs, %d records.\n", 
-        tv2f(where_we_are), iteration_count);
+        tv2f(whence_in_cls), iteration_count);
 #endif
     /* last CLRSCR-record goes till EOF, which is when we are */
-    cur_clrscr->time_elapsed_cls = where_we_are;
-    return(where_we_are);
+    cur_clrscr->time_elapsed_cls = whence_in_cls;
+    return(whence_in_cls);
 }
+
+/********* WIP */
 
 /* creates file index, returns pointer to index head    */
 File_ID * create_file_index(int start_arg, int argc, char **argv)
@@ -335,20 +335,69 @@ File_ID * create_file_index(int start_arg, int argc, char **argv)
 #endif
         if (argp == start_arg)
         {
-            prev_file = first_file = cur_fileid;
+            prev_file = NULL;
+            first_file = cur_fileid;
             whence_in_file.tv_sec = whence_in_file.tv_usec = 0;
         }
         cur_fileid->prev = prev_file;
-        prev_file->next = cur_fileid;
+        if(prev_file != NULL)
+            prev_file->next = cur_fileid;
         cur_fileid->next = NULL;
         cur_fileid->filename = strdup(argv[argp]);
         whence_in_file = index_one_file(cur_fileid, whence_in_file);
         /* for next iteration */
-        cur_fileid->time_elapsed_file = whence_in_file;
         prev_file = cur_fileid;
     }
 #ifdef DEBUG_INDEX
-    fprintf(stderr, "\n*** indexing complete *** \n\n");
+    fprintf(stderr, "\n*** indexing complete *** \n");
+    fprintf(stderr, "Index structure:\n");
+    File_ID *f, *g;
+    Clrscr_ID *c;
+    int i, j;
+    i = j = 0;
+    c = first_file->first_clrscr;
+    f = c->file_id;
+    g = NULL;
+    if (c->prev == NULL)
+        fprintf(stderr, "Sanity check: first clrscr->prev is null. Good.\n");
+    else
+        fprintf(stderr, "Sanity check *FAIL*: first clrscr->prev is *NOT* null.\n");
+    if (f->prev == NULL)
+        fprintf(stderr, "Sanity check: first file_id->prev is null. Good.\n");
+    else {
+        fprintf(stderr, "Sanity check: first file_id->prev is not null, but let's see... ");
+        if(f->prev == f) 
+            fprintf(stderr, "it points to itself. Good.\n");
+        else
+            fprintf(stderr, "it to random address. This is *BAD*.\n");
+    }
+    while(1) {
+        if(f != g) {
+            char *fn = strdup(f->filename);
+            fprintf(stderr, "File_ID #%d %s ends at %fs\n", 
+                    ++i, basename(fn), tv2f(f->last_clrscr->time_elapsed_cls));
+            free(fn);
+            if(f->prev == NULL)
+                fprintf(stderr, "Checking linkage... at first file, ->prev is NULL\n");
+            else fprintf(stderr, "Checking linkage... to prev: %s, from prev: %s\n",
+                            f->prev == NULL || f->prev == g ? "ok" : "FAIL",
+                            g->next == f ? "ok" : "FAIL");
+            g = f;
+        }
+        fprintf(stderr, "\tClrscr_ID #%d record at %d actual pos %d ends at %fs\n",
+                ++j, c->record_start, c->position, tv2f(c->time_elapsed_cls));
+        if(!c->next) {
+            fprintf(stderr, "Sanity check: final clrscr->next is null. Good.\n");
+            /* else we burn in infinite loop and crash in segfault ;) */
+            if(c->file_id->next == NULL)
+                fprintf(stderr, "Sanity check: final File_ID->next is null. Good.\n\n");
+            else
+                fprintf(stderr, "Sanity check *FAIL*: final File_ID->next is *NOT* null.\n\n");
+            break;
+        } else
+            c = c->next;    /* keep going on */
+        f = c->file_id;
+    }    
 #endif
     return (first_file);
 }
@@ -368,7 +417,7 @@ int switch_to_file(File_ID *target)
     if(target->prev == target)      /* first file of set */
         status.time_elapsed.tv_sec = status.time_elapsed.tv_usec = 0;
     else
-        status.time_elapsed = target->prev->time_elapsed_file;
+        status.time_elapsed = target->prev->last_clrscr->time_elapsed_cls;
 #ifdef DEBUG
     char *fn = strdup(target->filename);
     fprintf(stderr, "Opening file %s, time changes from %.6fs to %.6fs\n", 
@@ -433,7 +482,7 @@ int jump_file(int direction)
         free(fp);
 #endif
         int delta = timeval_sub(status.time_elapsed, 
-                                status.current_fileid->time_elapsed_file).tv_sec;
+                                status.current_fileid->last_clrscr->time_elapsed_cls).tv_sec;
         delta -= SWITCH_LATENCY;
         /* and one more time elapsed from SOF is less than SWITCH_LATENCY */
         if(delta < 0) { 
@@ -450,7 +499,7 @@ int jump_file(int direction)
         update_status(status.current_fileid->first_clrscr, 0, 
             status.current_fileid->prev == status.current_fileid ?
                 (struct timeval) {0, 0} : 
-                status.current_fileid->prev->time_elapsed_file);
+                status.current_fileid->prev->last_clrscr->time_elapsed_cls);
         return(0);
     }
 
@@ -463,12 +512,12 @@ int jump_file(int direction)
     if(status.current_fileid->prev == status.current_fileid)
         time_elapsed.tv_sec = time_elapsed.tv_usec = 0;
     else
-        time_elapsed = status.current_fileid->prev->time_elapsed_file;
+        time_elapsed = status.current_fileid->prev->last_clrscr->time_elapsed_cls;
 
     update_status(status.current_fileid->first_clrscr, 0, 
         status.current_fileid->prev == status.current_fileid ?
             (struct timeval) {0, 0} : 
-            status.current_fileid->prev->time_elapsed_file);
+            status.current_fileid->prev->last_clrscr->time_elapsed_cls);
 
     return(direction);
 }
@@ -531,8 +580,8 @@ int seek_index(struct timeval seek_target)
 #ifdef DEBUG_SEEK
     fprintf(stderr, "seek_index: found clrscr at %ldb ranging %.6fs through ", 
             cur_clrscr->record_start, 
-            cur_clrscr->prev == cur_clrscr ? 
-                tv2f(cur_clrscr->file_id->prev->time_elapsed_file) : 
+            cur_clrscr->prev == NULL ? 
+                tv2f(cur_clrscr->file_id->prev->last_clrscr->time_elapsed_cls) : /* TBD: what if first file? */
                 tv2f(cur_clrscr->prev->time_elapsed_cls));
     if(cur_clrscr->next == NULL) 
         fprintf(stderr, "the end\n");
@@ -543,7 +592,7 @@ int seek_index(struct timeval seek_target)
     /* switch fp to whichever file/record the index points to */
     cur_fileid = cur_clrscr->file_id;
 #ifdef DEBUG_SEEK
-    fn = strdup(cur_fileid->filename);
+    char *fn = strdup(cur_fileid->filename);
     fprintf(stderr, "seek_index: switching to file %s\n", basename(fn));
     free(fn);
 #endif
@@ -627,10 +676,10 @@ ttywait (struct timeval prev, struct timeval cur, double speed, int *key)
                     case 'O':    /* for arrow keys (don't ask me)  */
                         read(STDIN_FILENO, &c3, 1); /* drain the next character */
                         switch (c3) {
-                            case 'D':   /* right arrow  */
+                            case 'D':   /* left arrow  */
                                 status.seek_request.tv_sec += (speed * -JUMPBASE);
                                 break;
-                            case 'C':   /* left arrow   */
+                            case 'C':   /* right arrow   */
                                 status.seek_request.tv_sec += (speed * JUMPBASE);
                                 break;
                             case 'A':   /* up arrow     */
@@ -638,6 +687,18 @@ ttywait (struct timeval prev, struct timeval cur, double speed, int *key)
                                 break;
                             case 'B':   /* down arrow   */
                                 status.seek_request.tv_sec += (speed * JUMPBASE * JUMP_SCALE);
+                                break;
+                            /******** WIP */
+                            /* This may be a bit ugly: jump to start by directly adjusting status */
+                            case 'H':   /* Home */
+                                update_status(status.index_head->first_clrscr, 0, (struct timeval) {0, 0});
+                                break;
+                            /* For jump-to-end we seek to current time, and trust require-q-to-quit 
+                                to handle the rest. As future is not supposed to have happened yet,
+                                and as the game start shouldn't have happened before epoch, this 
+                                should be good enough. */
+                            case 'F':   /* End */
+                                gettimeofday(&(status.seek_request), NULL);
                                 break;
                             default:    /* unknown esc-O sequence  */
 #ifdef DEBUG                   
@@ -781,7 +842,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                 update_status(status.current_fileid->first_clrscr, 0, 
                     status.current_fileid->prev == status.current_fileid ?
                         (struct timeval) {0, 0} :
-                        status.current_fileid->prev->time_elapsed_file);
+                        status.current_fileid->prev->last_clrscr->time_elapsed_cls);
 #ifdef DEBUG
                 char *fn = strdup(status.current_fileid->filename);
                 fprintf(stderr, "Opening %s, time changes from %.6fs to %.6fs\n\n", 
@@ -791,7 +852,9 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                 free(buf);
                 continue;
             }
-        } /* TBD: else wait for keypress before quit*/
+            /* WIP: does switching time to negative work for q-to-quit? */
+            else speed = -speed;
+        } 
 
         if (!first_time) {
             int key = 0;    /* in case wait_func returns the keypress */
@@ -891,7 +954,7 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     }
 
                     cur_pos = ftell(fp);
-                    status.time_elapsed = timeval_add(status.time_elapsed, time_diff);   /* where-we-are         */
+                    status.time_elapsed = timeval_add(status.time_elapsed, time_diff);   /* where-we-are */
                     write_func(buf, h.len);             /* output the record    */
                     prev = h.tv;
                 }
