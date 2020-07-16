@@ -47,11 +47,11 @@
 #include "io.h"
 
 #define DEBUG
-#define DEBUG_INDEX  /* debug index creation */
-#define DEBUG_SEEK   /* debug seeking by time offset */
+#ifdef DEBUG
+#undef DEBUG_INDEX  /* debug index creation */
+#undef DEBUG_SEEK   /* debug seeking by time offset */
 #undef DEBUG_JUMP  /* debug jumping to next/prev file/clrscr */
 
-#ifdef DEBUG
 #include <libgen.h>
 #include <sys/stat.h>
 #endif
@@ -207,6 +207,22 @@ void free_fileid(File_ID *fileid_ptr)
     free(fileid_ptr);
 }
 
+/* free() with some sanity checks added */
+int release_buffer(char **buf, char *caller)
+{
+    if(caller == NULL) {
+        fprintf(stderr, "ERROR: anonymous call to buffer release\n");
+        return(FAIL);
+    }
+    if(buf == NULL && caller != NULL) {
+        fprintf(stderr, "ERROR: re-releasing buffer, called by %s\n", caller);
+        return(FAIL);
+    }
+    free(*buf);
+    buf = NULL;
+    return SUCCESS;
+}
+
 /* update status structure */
 void update_status(Clrscr_ID *clrscr, int position, struct timeval time_elapsed)
 {
@@ -315,8 +331,6 @@ struct timeval index_one_file(File_ID *file_id, struct timeval whence_in_cls)
     return(whence_in_cls);
 }
 
-/********* WIP */
-
 /* creates file index, returns pointer to index head    */
 File_ID * create_file_index(int start_arg, int argc, char **argv)
 {
@@ -345,6 +359,12 @@ File_ID * create_file_index(int start_arg, int argc, char **argv)
         cur_fileid->next = NULL;
         cur_fileid->filename = strdup(argv[argp]);
         whence_in_file = index_one_file(cur_fileid, whence_in_file);
+        /* link the per-file clrscr chain with that of previous file */
+        if(cur_fileid->prev != NULL) {  /* the prev file has to exist, of course */
+            cur_fileid->first_clrscr->prev = cur_fileid->prev->last_clrscr;
+            cur_fileid->prev->last_clrscr = cur_fileid->first_clrscr->prev;
+        }
+
         /* for next iteration */
         prev_file = cur_fileid;
     }
@@ -414,7 +434,7 @@ int switch_to_file(File_ID *target)
 #ifdef DEBUG
     struct timeval time_at_switch = status.time_elapsed;
 #endif
-    if(target->prev == target)      /* first file of set */
+    if(target->prev == NULL)      /* first file of set */
         status.time_elapsed.tv_sec = status.time_elapsed.tv_usec = 0;
     else
         status.time_elapsed = target->prev->last_clrscr->time_elapsed_cls;
@@ -563,7 +583,7 @@ int seek_index(struct timeval seek_target)
 {
     File_ID *cur_fileid;
     Clrscr_ID *cur_clrscr;
-    struct timeval when_we_are;
+    struct timeval tdelta;
 
 #ifdef DEBUG_SEEK
     fprintf(stderr, "Seeking from %lds to %lds\n",
@@ -573,16 +593,21 @@ int seek_index(struct timeval seek_target)
     /* since clrscr_id is chained from beginning to end, all we need
         is find the correct one */
     cur_clrscr = status.index_head->first_clrscr;
-    while(timeval_diff(seek_target, cur_clrscr->time_elapsed_cls).tv_sec >= 0 &&
-            cur_clrscr->next != NULL)
+
+    while(1) {
+        tdelta = timeval_diff(cur_clrscr->time_elapsed_cls, seek_target);
+        if(tdelta.tv_sec <= 0)
+            break;
+        if(cur_clrscr->next == NULL)
+            break;
         cur_clrscr = cur_clrscr->next;
+    }
 
 #ifdef DEBUG_SEEK
     fprintf(stderr, "seek_index: found clrscr at %ldb ranging %.6fs through ", 
             cur_clrscr->record_start, 
             cur_clrscr->prev == NULL ? 
-                tv2f(cur_clrscr->file_id->prev->last_clrscr->time_elapsed_cls) : /* TBD: what if first file? */
-                tv2f(cur_clrscr->prev->time_elapsed_cls));
+                0 : tv2f(cur_clrscr->prev->time_elapsed_cls));
     if(cur_clrscr->next == NULL) 
         fprintf(stderr, "the end\n");
     else 
@@ -599,8 +624,10 @@ int seek_index(struct timeval seek_target)
     status.current_fileid = cur_fileid;        /* propagate result upwards */
     if(!switch_to_file(status.current_fileid))
         return FAIL;
-    update_status(cur_clrscr, cur_clrscr->record_start, when_we_are);
-    /* the elapsed time is found at end of previous clrscr */
+    update_status(cur_clrscr, cur_clrscr->record_start, 
+            /* the elapsed time is found at end of previous clrscr, if any */
+            cur_clrscr->prev == NULL ? 
+                (struct timeval) {0, 0} : cur_clrscr->prev->time_elapsed_cls);
     return SUCCESS;
 }   
 
@@ -806,7 +833,9 @@ struct timeval get_header_time(ReadFunc read_func)
     status.position = ftell(status.fp);
     if(!read_func(status.fp, &h, &buf))
         exit(FAIL); /* TBD(?): not prepared for EOF */
-    free(buf);  /* we don't need the playload for anything, really */
+    /* we don't need the playload for anything, really */
+    if(!release_buffer(&buf, "get_header_time"))
+        exit(EXIT_FAILURE);
     fseek(status.fp, status.position, SEEK_SET);  /* seek back */
     return(h.tv);
 }
@@ -849,7 +878,8 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     basename(fn), tv2f(time_at_switch), tv2f(status.time_elapsed));
                 free(fn);            
 #endif
-                free(buf);
+                if(!release_buffer(&buf, "ttyplay switch to next file"))
+                    exit(EXIT_FAILURE);
                 continue;
             }
             /* WIP: does switching time to negative work for q-to-quit? */
@@ -949,6 +979,8 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                                 timeval_add(status.time_elapsed, time_diff)).tv_sec));
 #endif                        
                             write_func(buf, h.len);     /* output the record    */
+                            if(!release_buffer(&buf, "ttyplay sub-clrscr seek place #1"))
+                                exit(EXIT_FAILURE);
                             break;
                         }
                     }
@@ -956,6 +988,8 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
                     cur_pos = ftell(fp);
                     status.time_elapsed = timeval_add(status.time_elapsed, time_diff);   /* where-we-are */
                     write_func(buf, h.len);             /* output the record    */
+                    if(!release_buffer(&buf, "ttyplay sub-clrscr seek place #2"))
+                        exit(EXIT_FAILURE);
                     prev = h.tv;
                 }
                 /* sub-CLRSCR seek ends here, reposition back to 
@@ -974,10 +1008,11 @@ ttyplay (FILE *fp, double speed, ReadFunc read_func,
         first_time = 0;
 
         write_func(buf, h.len);
-
+        if(!release_buffer(&buf, "ttyplay end of loop"))
+            exit(EXIT_FAILURE);
+ 
         prev = h.tv;
-        free(buf);
-    }
+   }
 }
 
 void
